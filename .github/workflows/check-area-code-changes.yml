@@ -1,0 +1,168 @@
+name: Check Area Code Changes
+
+on:
+  schedule:
+    # Every Monday at 09:00 KST (00:00 UTC)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  AREA_CODE_API_URL: https://www.code.go.kr/stdcode/regCodeL.do
+  ISSUE_LABEL: area-code-update
+  ISSUE_ASSIGNEE: stevejkang
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.check.outputs.has_changes }}
+      start_date: ${{ steps.check.outputs.start_date }}
+      end_date: ${{ steps.check.outputs.end_date }}
+
+    steps:
+      - name: Check for area code changes
+        id: check
+        uses: actions/github-script@v7
+        env:
+          API_URL: ${{ env.AREA_CODE_API_URL }}
+        with:
+          script: |
+            const https = require('https');
+
+            const post = (url, params) => new Promise((resolve, reject) => {
+              const { hostname, pathname } = new URL(url);
+              const body = new URLSearchParams(params).toString();
+
+              const req = https.request({
+                hostname,
+                path: pathname,
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Content-Length': Buffer.byteLength(body)
+                }
+              }, res => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(data));
+              });
+
+              req.on('error', reject);
+              req.write(body);
+              req.end();
+            });
+
+            const formatDate = date => date.toISOString().split('T')[0];
+
+            const today = new Date();
+            const oneWeekAgo = new Date(today);
+            oneWeekAgo.setDate(today.getDate() - 7);
+
+            const [stdate, enddate] = [formatDate(oneWeekAgo), formatDate(today)];
+            console.log(`Checking: ${stdate} ~ ${enddate}`);
+
+            const response = await post(process.env.API_URL, {
+              pageSize: '100',
+              disuseAt: 'ALL',
+              stdate,
+              enddate
+            });
+
+            const noData = response.includes('조회된 자료가 없습니다.');
+            const hasChanges = !noData && (response.includes('폐지') || response.includes('현존'));
+
+            core.setOutput('has_changes', String(hasChanges));
+            core.setOutput('start_date', stdate);
+            core.setOutput('end_date', enddate);
+
+            console.log(hasChanges ? 'Changes detected' : 'No changes');
+
+  create-issue:
+    needs: check-changes
+    if: needs.check-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find existing issue
+        id: find
+        uses: actions/github-script@v7
+        env:
+          LABEL: ${{ env.ISSUE_LABEL }}
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: process.env.LABEL
+            });
+
+            if (issues.length > 0) {
+              core.setOutput('number', issues[0].number);
+            }
+            core.setOutput('exists', String(issues.length > 0));
+
+      - name: Create or update issue
+        uses: actions/github-script@v7
+        env:
+          EXISTING_ISSUE: ${{ steps.find.outputs.exists }}
+          ISSUE_NUMBER: ${{ steps.find.outputs.number }}
+          START_DATE: ${{ needs.check-changes.outputs.start_date }}
+          END_DATE: ${{ needs.check-changes.outputs.end_date }}
+          LABEL: ${{ env.ISSUE_LABEL }}
+          ASSIGNEE: ${{ env.ISSUE_ASSIGNEE }}
+          SOURCE_URL: ${{ env.AREA_CODE_API_URL }}
+        with:
+          script: |
+            const { EXISTING_ISSUE, ISSUE_NUMBER, START_DATE, END_DATE, LABEL, ASSIGNEE, SOURCE_URL } = process.env;
+            const { owner, repo } = context.repo;
+            const timestamp = new Date().toISOString();
+
+            if (EXISTING_ISSUE === 'true') {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: Number(ISSUE_NUMBER),
+                body: [
+                  '### Update (' + timestamp + ')',
+                  '',
+                  'Changes still pending.',
+                  '',
+                  '- **Period**: ' + START_DATE + ' ~ ' + END_DATE,
+                  '- **Source**: ' + SOURCE_URL
+                ].join('\n')
+              });
+              console.log('Updated issue #' + ISSUE_NUMBER);
+              return;
+            }
+
+            const body = [
+              '## Area Code Changes Detected',
+              '',
+              'Changes have been detected in the Korean legal area codes database.',
+              '',
+              '### Details',
+              '- **Check Period**: ' + START_DATE + ' ~ ' + END_DATE,
+              '- **Source**: ' + SOURCE_URL,
+              '- **Detected At**: ' + timestamp,
+              '',
+              '### Action Required',
+              '1. Visit [code.go.kr](' + SOURCE_URL + ') to review the changes',
+              '2. Update the `code.csv` file in this repository',
+              '3. Close this issue once the update is complete'
+            ].join('\n');
+
+            const { data: issue } = await github.rest.issues.create({
+              owner,
+              repo,
+              title: '[Action Required] Area Code Changes Detected (' + END_DATE + ')',
+              body,
+              labels: [LABEL, 'automated'],
+              assignees: [ASSIGNEE]
+            });
+
+            console.log('Created issue #' + issue.number + ': ' + issue.html_url);
